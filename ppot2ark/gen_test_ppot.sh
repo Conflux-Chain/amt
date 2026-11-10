@@ -17,7 +17,9 @@ pot_size=$((2**degree))
 
 feature=$2
 
-cargo install --git https://github.com/Conflux-Chain/pot-phase2.git --rev 1e7fd60 powersoftau --bin new_constrained_pot --features $feature --bin compute_constrained_pot --features $feature
+# Build the third-party tool without the caller's RUSTFLAGS (CI sets -D warnings,
+# which newer rustc lints in pot-phase2's dependencies turn into errors).
+env -u RUSTFLAGS cargo install --git https://github.com/Conflux-Chain/pot-phase2.git --rev 1e7fd60 powersoftau --bin new_constrained_pot --features $feature --bin compute_constrained_pot --features $feature
 
 new_constrained_pot data/challenge_${degree}_${feature} $degree $pot_size
 

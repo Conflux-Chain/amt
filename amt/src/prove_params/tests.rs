@@ -40,3 +40,17 @@ pub static DOMAIN: Lazy<Radix2EvaluationDomain<Fr<PE>>> =
     Lazy::new(|| Radix2EvaluationDomain::new(TEST_LENGTH).unwrap());
 
 pub static W: Lazy<Fr<PE>> = Lazy::new(|| DOMAIN.group_gen);
+
+#[test]
+fn test_reduce_prove_depth_keeps_basis_power() {
+    for depth in 1..=TEST_LEVEL {
+        let reduced = AMT.reduce_prove_depth(depth);
+        for idx in 0..TEST_LENGTH {
+            assert_eq!(
+                reduced.get_basis_power_at(idx),
+                AMT.get_basis_power_at(idx),
+                "depth = {depth}, idx = {idx}"
+            );
+        }
+    }
+}

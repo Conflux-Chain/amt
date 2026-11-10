@@ -51,7 +51,8 @@ impl<PE: Pairing> AmtParams<PE> {
             self.quotients[..depth].to_vec(),
             self.vanishes[..depth].to_vec(),
             self.g2.into(),
-            self.basis_power[..depth].to_vec(),
+            // basis_power is indexed by basis point (like `basis`), not by depth.
+            self.basis_power.clone(),
         )
     }
 }
@@ -72,6 +73,7 @@ impl<PE: Pairing> PartialEq for AmtParams<PE> {
             && self.quotients == other.quotients
             && self.vanishes == other.vanishes
             && self.g2 == other.g2
+            && self.basis_power == other.basis_power
     }
 }
 
