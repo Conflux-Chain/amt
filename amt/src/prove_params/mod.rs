@@ -73,6 +73,7 @@ impl<PE: Pairing> PartialEq for AmtParams<PE> {
             && self.quotients == other.quotients
             && self.vanishes == other.vanishes
             && self.g2 == other.g2
+            && self.basis_power == other.basis_power
     }
 }
 
