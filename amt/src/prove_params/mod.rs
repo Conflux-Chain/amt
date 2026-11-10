@@ -16,7 +16,8 @@ use super::ec_algebra::{G1Aff, G2Aff, G2};
 
 use ark_ec::{pairing::Pairing, CurveGroup};
 
-const SLOT_SIZE: usize = 6;
+/// Number of 40-bit slots in each AMT node value.
+pub const SLOT_SIZE: usize = 6;
 const SLOT_SIZE_MINUS_1: usize = SLOT_SIZE - 1;
 
 pub struct AmtParams<PE: Pairing> {
@@ -58,11 +59,20 @@ impl<PE: Pairing> AmtParams<PE> {
 }
 
 impl<PE: Pairing> AmtParams<PE> {
+    /// Borrowed form of [`Self::get_basis_power_at`]: returns `basis(idx)` and
+    /// `basis(idx) * 2^{40 * j}` for `j` in `1..SLOT_SIZE`, without copying.
+    #[inline]
+    pub fn basis_power_at(&self, idx: usize) -> (&G1Aff<PE>, &[G1Aff<PE>; SLOT_SIZE_MINUS_1]) {
+        (&self.basis[idx], &self.basis_power[idx])
+    }
+
+    /// Returns `basis(idx) * 2^{40 * j}` for `j` in `0..SLOT_SIZE` by value.
+    /// Prefer [`Self::basis_power_at`] on hot paths.
     pub fn get_basis_power_at(&self, idx: usize) -> [G1Aff<PE>; SLOT_SIZE] {
+        let (basis, powers) = self.basis_power_at(idx);
         let mut basis_power: [G1Aff<PE>; SLOT_SIZE] = Default::default();
-        basis_power[0] = self.basis[idx];
-        basis_power[1..].copy_from_slice(&self.basis_power[idx]);
-        // todo if cfg!(test)
+        basis_power[0] = *basis;
+        basis_power[1..].copy_from_slice(powers);
         basis_power
     }
 }
