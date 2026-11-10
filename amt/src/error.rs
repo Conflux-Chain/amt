@@ -1,3 +1,7 @@
+// error-chain 0.12's macro checks `cfg(has_error_description_deprecated)`,
+// which rustc >= 1.80 reports as an unexpected cfg in this crate.
+#![allow(unexpected_cfgs)]
+
 use error_chain::error_chain;
 
 error_chain! {
