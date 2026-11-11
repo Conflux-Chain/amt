@@ -232,21 +232,7 @@ mod tests {
     /// node, straight from the definition: the node `k` at level `d` covers
     /// the contiguous leaves `k * len / 2^{d+1} ..`.
     fn naive_tree(values: &[F]) -> Vec<Vec<(G1Aff<PE>, G1Aff<PE>)>> {
-        (0..TEST_LEVEL)
-            .map(|d| {
-                let chunk = TEST_LENGTH >> (d + 1);
-                (0..1 << (d + 1))
-                    .map(|k| {
-                        let range = k * chunk..(k + 1) * chunk;
-                        let c = G1::<PE>::msm(&AMT.basis[range.clone()], &values[range.clone()])
-                            .unwrap();
-                        let p = G1::<PE>::msm(&AMT.quotients[d][range.clone()], &values[range])
-                            .unwrap();
-                        (c.into_affine(), p.into_affine())
-                    })
-                    .collect()
-            })
-            .collect()
+        crate::proof_tree::tests::naive_tree(&AMT, values)
     }
 
     fn naive_proof(tree: &[Vec<(G1Aff<PE>, G1Aff<PE>)>], idx: usize) -> Proof<PE> {
