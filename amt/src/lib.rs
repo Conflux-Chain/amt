@@ -6,6 +6,7 @@ pub mod ec_algebra;
 mod error;
 mod power_tau;
 mod proof_tree;
+mod proof_tree_update;
 pub mod proofs;
 mod prove_params;
 mod quotient_power;
@@ -13,6 +14,7 @@ mod utils;
 
 pub use commitment::{batch_normalize, SlotChanges};
 pub use power_tau::PowerTau;
+pub use proof_tree_update::{NodeDiff, ProofNode, ProofTree, PROOF_DIFFS_PARALLEL_THRESHOLD};
 pub use proofs::{pack_slots, unpack_slots, AmtProofError, Proof};
 pub use prove_params::{AmtParams, CreateMode, SLOT_SIZE};
 pub use quotient_power::QuotientPower;
