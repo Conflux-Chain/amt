@@ -5,13 +5,13 @@ pub mod commitment;
 pub mod ec_algebra;
 mod error;
 mod power_tau;
-mod proofs;
+pub mod proofs;
 mod prove_params;
 mod utils;
 
 pub use commitment::{batch_normalize, SlotChanges};
 pub use power_tau::PowerTau;
-pub use proofs::AmtProofError;
+pub use proofs::{pack_slots, unpack_slots, AmtProofError, Proof};
 pub use prove_params::{AmtParams, CreateMode, SLOT_SIZE};
 pub use utils::ptau_file_name;
 
