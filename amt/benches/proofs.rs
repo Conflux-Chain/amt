@@ -85,6 +85,32 @@ fn bench_proof_tree_update(c: &mut Criterion) {
     group.finish();
 }
 
+/// Non-zero leaves of a level-1 AMT (40M keys) and of the whole root AMT.
+const WEIGHTED_SIZES: [usize; 2] = [610, 65536];
+
+fn bench_weighted(c: &mut Criterion) {
+    let (params, _) = load_params();
+    let n = params.len();
+    let mut rng = StdRng::seed_from_u64(3);
+    let mut group = c.benchmark_group("proof_tree_weighted");
+    group.sample_size(10);
+    for m in WEIGHTED_SIZES.into_iter().filter(|m| *m <= n) {
+        let leaves = rand::seq::index::sample(&mut rng, n, m).into_vec();
+        let changes: Vec<(usize, Fr<PE>)> =
+            leaves.into_iter().zip(random_values(&mut rng, m)).collect();
+        let idx = rng.gen_range(0..n);
+        group.bench_with_input(BenchmarkId::new("path_siblings", m), &m, |b, _| {
+            b.iter(|| {
+                params.proof_tree_diffs_weighted(changes.iter().copied(), params.path_siblings(idx))
+            })
+        });
+        group.bench_with_input(BenchmarkId::new("all", m), &m, |b, _| {
+            b.iter(|| params.proof_tree_diffs_weighted(changes.iter().copied(), |_, _| true))
+        });
+    }
+    group.finish();
+}
+
 fn bench_verify(c: &mut Criterion) {
     let (params, _) = load_params();
     let n = params.len();
@@ -109,5 +135,11 @@ fn bench_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_proof_tree_update, bench_verify, bench_build);
+criterion_group!(
+    benches,
+    bench_proof_tree_update,
+    bench_weighted,
+    bench_verify,
+    bench_build
+);
 criterion_main!(benches);
