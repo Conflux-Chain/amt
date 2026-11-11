@@ -11,26 +11,51 @@
 //! callers can keep them in their own (versioned) storage; [`ProofTree`] is a
 //! sparse in-memory store built on it.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use ark_ec::{
     pairing::Pairing,
     short_weierstrass::{Affine, Projective, SWCurveConfig},
 };
+use ark_std::cfg_into_iter;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::{
     commitment::{batch_normalize, SlotChanges},
-    ec_algebra::{AffineRepr, CurveGroup, Fr, G1Aff, Zero, G1},
+    ec_algebra::{AffineRepr, CurveGroup, Fr, G1Aff, VariableBaseMSM, Zero, G1},
     proofs::{pack_slots, AllProofs, Proof},
     AmtParams, QuotientPower, SLOT_SIZE,
 };
 
-/// With the `parallel` feature, [`AmtParams::proof_tree_diffs`] spreads
-/// levels over threads only from this many changed leaves on (when
-/// quotient powers are given; scalar multiplications always go parallel).
+/// With the `parallel` feature, [`AmtParams::proof_tree_diffs`] with quotient
+/// powers spreads levels over threads only from this many changed leaves on.
+/// Paths doing scalar multiplications always go parallel.
 pub const PROOF_DIFFS_PARALLEL_THRESHOLD: usize = 64;
+
+/// [`AmtParams::proof_tree_diffs_weighted`] splits MSMs into chunks of at
+/// most this many points, so that large nodes spread over threads.
+const WEIGHTED_MSM_CHUNK: usize = 4096;
+
+/// A touched node in [`AmtParams::proof_tree_diffs_weighted`].
+#[derive(Clone)]
+struct PlannedNode {
+    index: usize,
+    /// Range of the changed leaves below the node.
+    leaves: Range<usize>,
+    /// Range of the touched children in the level below.
+    children: Range<usize>,
+    keep: bool,
+    /// The commitment is the sum of the children commitments.
+    summed: bool,
+}
+
+impl PlannedNode {
+    /// Whether the commitment is computed.
+    fn known(&self) -> bool {
+        self.keep || self.summed
+    }
+}
 
 /// Change of one proof tree node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,7 +76,9 @@ impl<PE: Pairing> AmtParams<PE> {
     /// result is sorted by `(level, index)`.
     ///
     /// With `powers`, every proof update is point additions; without it,
-    /// each changed leaf costs one scalar multiplication per level.
+    /// this is [`Self::proof_tree_diffs_weighted`] with
+    /// `pack_slots(changed slots)` as the deltas, which costs about one
+    /// scalar multiplication per changed leaf and level.
     ///
     /// A leaf listed several times is bumped once per listing, as in
     /// [`Self::commitment_diff`].
@@ -72,14 +99,18 @@ impl<PE: Pairing> AmtParams<PE> {
         powers: Option<&QuotientPower<PE>>,
         keep: impl Fn(usize, usize) -> bool + Sync,
     ) -> Vec<NodeDiff<PE>> {
+        let Some(powers) = powers else {
+            let weighted = changes
+                .into_iter()
+                .map(|(idx, slots)| (idx, slot_scalar::<PE>(slots)));
+            return self.proof_tree_diffs_weighted(weighted, keep);
+        };
         let levels = self.quotients.len();
-        if let Some(powers) = powers {
-            assert_eq!(
-                powers.levels(),
-                levels,
-                "quotient powers do not match the prove depth"
-            );
-        }
+        assert_eq!(
+            powers.levels(),
+            levels,
+            "quotient powers do not match the prove depth"
+        );
         let depth = ark_std::log2(self.len()) as usize;
 
         let mut changes: Vec<(usize, &SlotChanges)> = changes
@@ -111,36 +142,24 @@ impl<PE: Pairing> AmtParams<PE> {
 
         // Proofs: every level needs its own quotients, so levels are
         // independent.
-        let scalars: Option<Vec<Fr<PE>>> = powers
-            .is_none()
-            .then(|| changes.iter().map(|(_, s)| slot_scalar::<PE>(s)).collect());
         let level_proofs = |d: usize| -> Vec<(usize, G1<PE>)> {
             merge_sorted(
                 changes
                     .iter()
-                    .enumerate()
-                    .map(|(i, (idx, slots))| (i, idx >> shift(d), *idx, *slots))
-                    .filter(|(_, node, _, _)| keep(d, *node))
-                    .map(|(i, node, idx, slots)| {
-                        let diff = match (powers, &scalars) {
-                            (Some(powers), _) => {
-                                let (q, qp) = self.quotient_power_at(powers, d, idx);
-                                let mut acc = G1::<PE>::zero();
-                                add_slot_points::<PE>(&mut acc, q, qp, slots);
-                                acc
-                            }
-                            (None, Some(scalars)) => self.quotients[d][idx] * scalars[i],
-                            (None, None) => unreachable!(),
-                        };
-                        (node, diff)
+                    .map(|(idx, slots)| (idx >> shift(d), *idx, *slots))
+                    .filter(|(node, _, _)| keep(d, *node))
+                    .map(|(node, idx, slots)| {
+                        let (q, qp) = self.quotient_power_at(powers, d, idx);
+                        let mut acc = G1::<PE>::zero();
+                        add_slot_points::<PE>(&mut acc, q, qp, slots);
+                        (node, acc)
                     }),
             )
         };
         // Waking the rayon pool costs ~20µs, more than a small batch of point
-        // additions takes. Scalar multiplications are always worth it.
+        // additions takes.
         #[cfg(feature = "parallel")]
-        let proofs: Vec<_> = if powers.is_none() || changes.len() >= PROOF_DIFFS_PARALLEL_THRESHOLD
-        {
+        let proofs: Vec<_> = if changes.len() >= PROOF_DIFFS_PARALLEL_THRESHOLD {
             (0..levels).into_par_iter().map(level_proofs).collect()
         } else {
             (0..levels).map(level_proofs).collect()
@@ -162,6 +181,183 @@ impl<PE: Pairing> AmtParams<PE> {
             }
         }
         diffs
+    }
+}
+
+impl<PE: Pairing> AmtParams<PE> {
+    /// Like [`Self::proof_tree_diffs_with`], but leaf `idx` gets an arbitrary
+    /// `delta` added to its value instead of one per changed slot: e.g.
+    /// [`pack_slots`] of per-slot increments, its negation to roll changes
+    /// back, or a whole leaf value to compute nodes from scratch. A leaf
+    /// listed several times gets the sum of its deltas.
+    ///
+    /// Each kept node costs one MSM over the changed leaves below it for its
+    /// proof, and one for its commitment unless the commitments of its
+    /// changed children are computed anyway. With
+    /// [`Self::path_siblings`] as `keep`, every leaf is in exactly one kept
+    /// node, so the total is two MSMs worth of work over the changed leaves.
+    pub fn proof_tree_diffs_weighted(
+        &self,
+        changes: impl IntoIterator<Item = (usize, Fr<PE>)>,
+        keep: impl Fn(usize, usize) -> bool + Sync,
+    ) -> Vec<NodeDiff<PE>> {
+        let levels = self.quotients.len();
+        let depth = ark_std::log2(self.len()) as usize;
+
+        let mut changes: Vec<(usize, Fr<PE>)> = changes.into_iter().collect();
+        for (idx, _) in &changes {
+            assert!(*idx < self.len(), "leaf index {idx} out of range");
+        }
+        changes.sort_unstable_by_key(|(idx, _)| *idx);
+        let (leaves, deltas): (Vec<usize>, Vec<Fr<PE>>) = merge_sorted(changes)
+            .into_iter()
+            .filter(|(_, delta)| !delta.is_zero())
+            .unzip();
+        if leaves.is_empty() {
+            return Vec::new();
+        }
+
+        // Plan, bottom-up: the touched nodes of every level with the range
+        // of `leaves` below them (sorted leaves give contiguous ranges), and
+        // how their commitments are found: summed from the children if all
+        // changed children are known, else by an MSM if the node is kept.
+        let mut plan: Vec<Vec<PlannedNode>> = vec![Vec::new(); levels];
+        for d in (0..levels).rev() {
+            let shift = depth - 1 - d;
+            let mut nodes: Vec<PlannedNode> = Vec::new();
+            for (i, idx) in leaves.iter().enumerate() {
+                match nodes.last_mut() {
+                    Some(node) if node.index == idx >> shift => node.leaves.end = i + 1,
+                    _ => nodes.push(PlannedNode {
+                        index: idx >> shift,
+                        leaves: i..i + 1,
+                        children: 0..0,
+                        keep: false,
+                        summed: false,
+                    }),
+                }
+            }
+            if let Some(below) = plan.get(d + 1) {
+                let mut start = 0;
+                for node in &mut nodes {
+                    let count = below[start..]
+                        .iter()
+                        .take_while(|child| child.index >> 1 == node.index)
+                        .count();
+                    node.children = start..start + count;
+                    node.summed = below[node.children.clone()].iter().all(PlannedNode::known);
+                    start += count;
+                }
+            }
+            for node in &mut nodes {
+                node.keep = keep(d, node.index);
+            }
+            plan[d] = nodes;
+        }
+
+        // Every MSM (kept proofs, and commitments that are not summed), split
+        // into chunks so that all threads stay busy.
+        let mut tasks: Vec<(&[G1Aff<PE>], Range<usize>)> = Vec::new();
+        for (d, nodes) in plan.iter().enumerate() {
+            for node in nodes.iter().filter(|node| node.keep) {
+                tasks.push((&self.quotients[d], node.leaves.clone()));
+                if !node.summed {
+                    tasks.push((&self.basis, node.leaves.clone()));
+                }
+            }
+        }
+        let chunks: Vec<_> = tasks
+            .into_iter()
+            .enumerate()
+            .flat_map(|(task, (bases, range))| {
+                range.clone().step_by(WEIGHTED_MSM_CHUNK).map(move |start| {
+                    (
+                        task,
+                        bases,
+                        start..range.end.min(start + WEIGHTED_MSM_CHUNK),
+                    )
+                })
+            })
+            .collect();
+        let sums = cfg_into_iter!(chunks).map(|(task, bases, range)| {
+            // `Σ bases[leaf] * delta` over the chunk.
+            let scalars = &deltas[range.clone()];
+            let sum = match &leaves[range] {
+                [idx] => bases[*idx] * scalars[0],
+                idxs => {
+                    let points: Vec<G1Aff<PE>> = idxs.iter().map(|idx| bases[*idx]).collect();
+                    G1::<PE>::msm_unchecked(&points, scalars)
+                }
+            };
+            (task, sum)
+        });
+        let mut results = merge_sorted(sums.collect::<Vec<_>>())
+            .into_iter()
+            .map(|(_, sum)| sum);
+
+        // Collect the results in task order, summing commitments bottom-up.
+        let mut proofs: Vec<Vec<G1<PE>>> = vec![Vec::new(); levels];
+        let mut commitments: Vec<Vec<Option<G1<PE>>>> = vec![Vec::new(); levels];
+        for (d, nodes) in plan.iter().enumerate() {
+            for node in nodes {
+                if node.keep {
+                    proofs[d].push(results.next().unwrap());
+                }
+                commitments[d].push((node.keep && !node.summed).then(|| results.next().unwrap()));
+            }
+        }
+        debug_assert!(results.next().is_none());
+        for d in (0..levels - 1).rev() {
+            let (above, below) = commitments.split_at_mut(d + 1);
+            for (node, commitment) in plan[d].iter().zip(&mut above[d]) {
+                if node.summed {
+                    let children = below[0][node.children.clone()].iter();
+                    *commitment = Some(children.map(|c| c.unwrap()).sum());
+                }
+            }
+        }
+
+        let mut diffs = Vec::new();
+        for (d, nodes) in plan.iter().enumerate() {
+            let kept = nodes
+                .iter()
+                .zip(&commitments[d])
+                .filter(|(node, _)| node.keep);
+            for ((node, commitment), proof) in kept.zip(&proofs[d]) {
+                diffs.push(NodeDiff {
+                    level: d,
+                    index: node.index,
+                    commitment: commitment.expect("kept nodes are computed"),
+                    proof: *proof,
+                });
+            }
+        }
+        diffs
+    }
+
+    /// A `keep` filter for the nodes making up the proof of leaf `idx`: at
+    /// every level, the sibling of the node containing `idx`.
+    pub fn path_siblings(&self, idx: usize) -> impl Fn(usize, usize) -> bool + Copy + Send + Sync {
+        assert!(idx < self.len(), "leaf index {idx} out of range");
+        let depth = ark_std::log2(self.len()) as usize;
+        move |level, index| index == (idx >> (depth - 1 - level)) ^ 1
+    }
+
+    /// The proof of leaf `idx` in the AMT whose non-zero leaves are `values`
+    /// (`(index, value)`, summed if an index repeats), computed directly
+    /// from the values without a proof tree. Check it with [`Self::verify`]
+    /// against the commitment of `values`.
+    pub fn prove_sparse(
+        &self,
+        values: impl IntoIterator<Item = (usize, Fr<PE>)>,
+        idx: usize,
+    ) -> Proof<PE> {
+        let mut nodes = vec![[G1::<PE>::zero(); 2]; self.quotients.len()];
+        for diff in self.proof_tree_diffs_weighted(values, self.path_siblings(idx)) {
+            nodes[diff.level] = [diff.commitment, diff.proof];
+        }
+        let affine = G1::<PE>::normalize_batch(nodes.as_flattened());
+        Proof::new(affine.chunks_exact(2).map(|p| (p[0], p[1])).collect())
     }
 }
 
@@ -306,7 +502,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prove_params::tests::{AMT, PE, TEST_LENGTH, TEST_LEVEL};
+    use crate::{
+        proofs::SLOT_BITS,
+        prove_params::tests::{AMT, PE, TEST_LENGTH, TEST_LEVEL},
+    };
     use once_cell::sync::Lazy;
     use rand::Rng;
 
@@ -436,6 +635,152 @@ mod tests {
         let kept = AMT.proof_tree_diffs_with(as_refs(&changes), Some(&POWERS), keep);
         let expected: Vec<_> = all.into_iter().filter(|d| keep(d.level, d.index)).collect();
         assert_eq!(kept, expected);
+    }
+
+    fn random_value(rng: &mut impl Rng) -> F {
+        pack_slots(&std::array::from_fn(|_| rng.gen_range(0..1 << SLOT_BITS))).unwrap()
+    }
+
+    fn sparse_values(rng: &mut impl Rng, count: usize) -> Vec<(usize, F)> {
+        (0..count)
+            .map(|_| (rng.gen_range(0..TEST_LENGTH), random_value(rng)))
+            .collect()
+    }
+
+    fn dense(values: &[(usize, F)]) -> Vec<F> {
+        let mut out = vec![F::zero(); TEST_LENGTH];
+        for (idx, v) in values {
+            out[*idx] += v;
+        }
+        out
+    }
+
+    fn assert_trees_eq(a: &ProofTree<PE>, b: &ProofTree<PE>) {
+        assert_eq!(a.levels(), b.levels());
+        assert_eq!(a.stored_nodes(), b.stored_nodes());
+        for d in 0..a.levels() {
+            for k in 0..2 << d {
+                assert_eq!(a.node(d, k), b.node(d, k), "d = {d}, k = {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_weighted_matches_repeated_slot_changes() {
+        let mut rng = rand::thread_rng();
+        let mut weighted = Vec::new();
+        let mut repeated = Vec::new();
+        for _ in 0..20 {
+            let idx = rng.gen_range(0..TEST_LENGTH);
+            let counts: [u64; SLOT_SIZE] = std::array::from_fn(|_| rng.gen_range(0..4));
+            weighted.push((idx, pack_slots::<F>(&counts).unwrap()));
+            for round in 0..3 {
+                repeated.push((idx, counts.map(|c| c > round)));
+            }
+        }
+        let keep = |level: usize, index: usize| (level + index) % 3 != 1;
+        for keep in [
+            &(|_, _| true) as &(dyn Fn(usize, usize) -> bool + Sync),
+            &keep,
+        ] {
+            assert_eq!(
+                AMT.proof_tree_diffs_weighted(weighted.iter().copied(), keep),
+                AMT.proof_tree_diffs_with(as_refs(&repeated), Some(&POWERS), keep)
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_from_zero_matches_build() {
+        let mut rng = rand::thread_rng();
+        for depth in 1..=TEST_LEVEL {
+            let params = AMT.reduce_prove_depth(depth);
+            for count in [1, 5, TEST_LENGTH, 3 * TEST_LENGTH] {
+                let values = sparse_values(&mut rng, count);
+                let mut tree = ProofTree::new(&params);
+                tree.apply(&params.proof_tree_diffs_weighted(values.iter().copied(), |_, _| true));
+                let (root, built) = params.build_proof_tree(&dense(&values));
+                assert_eq!(tree.commitment(), root);
+                assert_trees_eq(&tree, &ProofTree::from_all_proofs(&built));
+            }
+        }
+    }
+
+    #[test]
+    fn test_prove_sparse() {
+        let mut rng = rand::thread_rng();
+        for count in [0, 1, 7, TEST_LENGTH] {
+            let values = sparse_values(&mut rng, count);
+            let dense = dense(&values);
+            let (root, built) = AMT.build_proof_tree(&dense);
+            for (idx, value) in dense.iter().enumerate() {
+                let proof = AMT.prove_sparse(values.iter().copied(), idx);
+                assert_eq!(proof, built.get_proof(idx));
+                assert_eq!(AMT.verify(&root, idx, *value, &proof), Ok(()));
+
+                let diffs =
+                    AMT.proof_tree_diffs_weighted(values.iter().copied(), AMT.path_siblings(idx));
+                assert!(diffs.len() <= TEST_LEVEL);
+                assert!(diffs
+                    .iter()
+                    .all(|d| AMT.path_siblings(idx)(d.level, d.index)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_weighted_keep_filter() {
+        let mut rng = rand::thread_rng();
+        let values = sparse_values(&mut rng, 30);
+        let all = AMT.proof_tree_diffs_weighted(values.iter().copied(), |_, _| true);
+        for keep in [
+            &(|level: usize, index: usize| (level + index) % 3 != 0) as &(dyn Fn(_, _) -> _ + Sync),
+            &AMT.path_siblings(5),
+            &|level, _| level == TEST_LEVEL - 1,
+            &|level, _| level == 0,
+            &|_, _| false,
+        ] {
+            let expected: Vec<_> = all
+                .iter()
+                .filter(|d| keep(d.level, d.index))
+                .cloned()
+                .collect();
+            assert_eq!(
+                AMT.proof_tree_diffs_weighted(values.iter().copied(), keep),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_negation_rolls_back() {
+        let mut rng = rand::thread_rng();
+        let base = sparse_values(&mut rng, 10);
+        let mut tree = ProofTree::new(&AMT);
+        tree.apply(&AMT.proof_tree_diffs_weighted(base.iter().copied(), |_, _| true));
+        let original = tree.clone();
+
+        let deltas = sparse_values(&mut rng, 10);
+        tree.apply(&AMT.proof_tree_diffs_weighted(deltas.iter().copied(), |_, _| true));
+        let negated = deltas.iter().map(|(idx, v)| (*idx, -*v));
+        tree.apply(&AMT.proof_tree_diffs_weighted(negated, |_, _| true));
+        assert_trees_eq(&tree, &original);
+
+        // Removing every value leaves no stored node.
+        let negated = base.iter().map(|(idx, v)| (*idx, -*v));
+        tree.apply(&AMT.proof_tree_diffs_weighted(negated, |_, _| true));
+        assert_eq!(tree.stored_nodes(), 0);
+    }
+
+    #[test]
+    fn test_weighted_cancelling_deltas() {
+        let v = F::from(12345u64);
+        assert!(AMT
+            .proof_tree_diffs_weighted([(3, v), (3, -v)], |_, _| true)
+            .is_empty());
+        assert!(AMT
+            .proof_tree_diffs_weighted([(3, F::zero())], |_, _| true)
+            .is_empty());
     }
 
     #[test]
