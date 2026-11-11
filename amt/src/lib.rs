@@ -5,6 +5,7 @@ pub mod commitment;
 pub mod ec_algebra;
 mod error;
 mod power_tau;
+mod proof_tree;
 pub mod proofs;
 mod prove_params;
 mod utils;

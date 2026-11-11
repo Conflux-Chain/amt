@@ -9,11 +9,9 @@
 // repo should import from here.
 
 #[cfg(test)]
-pub use ark_ec::VariableBaseMSM;
-#[cfg(test)]
 pub use ark_ff::{Field, One};
 
-pub use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup};
+pub use ark_ec::{pairing::Pairing, AffineRepr, CurveGroup, VariableBaseMSM};
 pub use ark_ff::{utils::k_adicity, BigInt, BigInteger, PrimeField, UniformRand, Zero};
 pub use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 pub use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Read, Write};
