@@ -18,7 +18,7 @@ use ark_ec::{pairing::Pairing, CurveGroup};
 
 /// Number of 40-bit slots in each AMT node value.
 pub const SLOT_SIZE: usize = 6;
-const SLOT_SIZE_MINUS_1: usize = SLOT_SIZE - 1;
+pub(crate) const SLOT_SIZE_MINUS_1: usize = SLOT_SIZE - 1;
 
 pub struct AmtParams<PE: Pairing> {
     pub(super) basis: Vec<G1Aff<PE>>,
